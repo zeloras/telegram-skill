@@ -14,17 +14,23 @@
 
 # TODO: Documentation 
 
-
+import os
+import uuid
+import wave
+from io import BytesIO
+from pydub import AudioSegment
+import numpy as np
 import telegram
-from telegram import Update
-
+import requests
 from alsaaudio import Mixer
 from mycroft.skills.core import MycroftSkill
 from mycroft.util.log import LOG
-from telegram.ext import Updater, MessageHandler, Filters, CommandHandler
+from mycroft.api import DeviceApi
+from telegram.ext import Updater, MessageHandler, Filters
 from websocket import create_connection, WebSocket
 from mycroft.messagebus.message import Message
-from mycroft.api import DeviceApi
+from deepspeech import Model
+
 from mycroft.audio import wait_while_speaking
 from mycroft.util.log import getLogger
 
@@ -32,7 +38,6 @@ logger = getLogger(__name__)
 
 speak_tele = 0
 loaded = 0
-audioinit = 0
 
 __author__ = 'luke5sky'
 
@@ -41,143 +46,171 @@ class TelegramSkill(MycroftSkill):
         super(TelegramSkill, self).__init__(name="TelegramSkill")
 
     def initialize(self):
-        # Handling settings changes 
-        self.settings_change_callback = self.on_settings_changed
-        self.on_settings_changed()
+        self.telegram_updater = None
+        self.mute = str(self.settings.get('MuteIt', ''))
+        if (self.mute == 'True') or (self.mute == 'true'):
+            try:
+                self.mixer = Mixer()
+                msg = "Telegram Messages will temporary Mute Mycroft"
+                logger.info(msg)
+            except:
+                msg = "There is a problem with alsa audio, mute is not working!"
+                logger.info("There is a problem with alsaaudio, mute is not working!")
+                self.sendMycroftSay(msg)
+                self.mute = 'false'
+        else:
+            logger.info("Telegram: Muting is off")
+            self.mute = "false"
         self.add_event('telegram-skill:response', self.sendHandler)
         self.add_event('speak', self.responseHandler)
-        
+        user_id1 = self.settings.get('TeleID1', '')
+        user_id2 = self.settings.get('TeleID2', '')
+        # user_id3 = self.settings.get('TeleID3', '') # makes web-settings too crouded
+        # user_id4 = self.settings.get('TeleID4', '') # makes web-settings too crouded
+        self.chat_whitelist = [user_id1, user_id2]  # ,user_id3,user_id4] # makes web-settings too crouded
+        # Get Bot Token from settings.json
+        UnitName = DeviceApi().get()['name']
+        MyCroftDevice1 = self.settings.get('MDevice1', '')
+        MyCroftDevice2 = self.settings.get('MDevice2', '')
+        self.bottoken = ""
+        if MyCroftDevice1 == UnitName:
+            logger.debug("Found MyCroft Unit 1: " + UnitName)
+            self.bottoken = self.settings.get('TeleToken1', '')
+        elif MyCroftDevice2 == UnitName:
+            logger.debug("Found MyCroft Unit 2: " + UnitName)
+            self.bottoken = self.settings.get('TeleToken2', '')
+        else:
+            msg = ("No or incorrect Device Name specified! Your DeviceName is: " + UnitName)
+            logger.info(msg)
+            self.sendMycroftSay(msg)
+
         # Connection to Telegram API
         try:
-           self.telegram_updater = Updater(token=self.bottoken, use_context=True) # get telegram Updates
-           self.telegram_dispatcher = self.telegram_updater.dispatcher
-           receive_handler = MessageHandler(Filters.text, self.TelegramMessages) # TODO: Make audio Files as Input possible: Filters.text | Filters.audio
-           self.telegram_dispatcher.add_handler(receive_handler)
-           self.telegram_updater.start_polling(clean=True) # start clean and look for messages
-           wbot = telegram.Bot(token=self.bottoken)
+            self.telegram_updater = Updater(token=self.bottoken, use_context=True)  # get telegram Updates
+            self.telegram_dispatcher = self.telegram_updater.dispatcher
+            receive_handler = MessageHandler((Filters.voice | Filters.text),
+                                             self.TelegramMessages)  # TODO: Make audio Files as Input possible: Filters.text | Filters.audio
+            self.telegram_dispatcher.add_handler(receive_handler)
+            self.telegram_updater.start_polling(clean=True)  # start clean and look for messages
+            wbot = telegram.Bot(token=self.bottoken)
         except:
-           pass
-        global loaded # get global variable
-        if loaded == 0: # check if bot has just started
-           loaded = 1 # make sure that users gets this message only once bot is newly loaded
-           if self.mute == "false":
-              msg = "Telegram Skill is loaded"
-              self.sendMycroftSay(msg)
-           loadedmessage = "Telegram-Skill on Mycroft Unit \""+ self.UnitName + "\" is loaded and ready to use!" # give User a nice message
-           try:
-              wbot.send_message(chat_id=self.user_id1, text=loadedmessage) # send welcome message to user 1
-           except:
-              pass             
-           try:
-              wbot.send_message(chat_id=self.user_id2, text=loadedmessage) # send welcome message to user 2
-           except:
-              pass
+            pass
+        global loaded  # get global variable
+        if loaded == 0:  # check if bot is just started
+            loaded = 1  # make sure that users gets this message only once bot is newly loaded
+            if self.mute == "false":
+                msg = "Telegram Skill is loaded"
+                self.sendMycroftSay(msg)
+            loadedmessage = "Telegram-Skill on Mycroft Unit \"" + UnitName + "\" is loaded and ready to use!"  # give User a nice message
+            try:
+                wbot.send_message(chat_id=user_id1, text=loadedmessage)  # send welcome message to user 1
+            except:
+                pass
+            try:
+                wbot.send_message(chat_id=user_id2, text=loadedmessage)  # send welcome message to user 2
+            except:
+                pass
 
-    def on_settings_changed(self):
-        global speak_tele
-        speak_tele = 0
-        self.telegram_updater = None
-        self.mute = str(self.settings.get('MuteIt',''))
-        if (self.mute == 'True') or (self.mute == 'true'):
-           try:
-               self.mixer = Mixer()
-               msg = "Telegram Messages will temporary mute Mycroft"
-               logger.info(msg)
-           except:
-               global audioinit
-               if audioinit == 0:
-                  audioinit = 1
-                  msg = "There is a problem with alsa audio, mute is not working!"
-                  self.sendMycroftSay(msg)
-                  logger.info("There is a problem with alsaaudio, mute is not working!")
-               self.mute = 'false'
-        else:
-           logger.info("Telegram: Muting is off")
-           self.mute = "false"
-        
-        try:
-            # Get Bot Token from settings.json
-            self.UnitName = DeviceApi().get()['name']
-            MyCroftDevice1 = self.settings.get('MDevice1','')
-            MyCroftDevice2 = self.settings.get('MDevice2','')
-        except:
-            pass
-        try:
-            self.bottoken = ""
-            if MyCroftDevice1 == self.UnitName:
-               logger.debug("Found MyCroft Unit 1: " + self.UnitName)
-               self.bottoken = self.settings.get('TeleToken1', '')
-            elif MyCroftDevice2 == self.UnitName:
-               logger.debug("Found MyCroft Unit 2: " + self.UnitName)
-               self.bottoken = self.settings.get('TeleToken2', '')
-            else:
-               msg = ("No or incorrect Device Name specified! Your DeviceName is: " + self.UnitName)
-               logger.info(msg)
-               self.sendMycroftSay(msg)
-        except:
-            pass
-        try:
-            self.user_id1 = self.settings.get('TeleID1', '')
-            self.user_id2 = self.settings.get('TeleID2', '')
-            self.chat_whitelist = [self.user_id1,self.user_id2]
-        except:
-            pass
-    
+    #           wbot.send_message(chat_id=user_id1, text=loadedmessage) # send welcome message to user 3
+    #           wbot.send_message(chat_id=user_id1, text=loadedmessage) # send welcome message to user 4
+
     def TelegramMessages(self, update, context):
-        msg = update.message.text
+        is_voice_message = not update.message.text and hasattr(update.message, 'voice')
         chat_id_test = update.message.chat_id
         self.chat_id = str(update.message.chat_id)
-        if self.chat_whitelist.count(chat_id_test) > 0 :
-           global speak_tele
-           speak_tele = 1
-           logger.info("Telegram-Message from User: " + msg)
-           msg = msg.replace('\\', ' ').replace('\"', '\\\"').replace('(', ' ').replace(')', ' ').replace('{', ' ').replace('}', ' ')
-           msg = msg.casefold() # some skills need lowercase (eg. the cows list)
-           self.add_event('recognizer_loop:audio_output_start', self.muteHandler)
-           self.sendMycroftUtt(msg) 
+        if is_voice_message:
+            msg = self.text_from_audio_file(update.message.voice)
         else:
-           logger.info("Chat ID " + self.chat_id + " is not whitelisted, i don't process it")
-           nowhite = ("This is your ChatID: " + self.chat_id)
-           context.bot.send_message(chat_id=self.chat_id, text=nowhite)    
+            msg = update.message.text
+
+        if self.chat_whitelist.count(chat_id_test) > 0:
+            global speak_tele
+            speak_tele = 1
+            logger.info("Telegram-Message from User: " + msg)
+            msg = msg.replace('\\', ' ').replace('\"', '\\\"').replace('(', ' ').replace(')', ' ').replace('{',
+                                                                                                           ' ').replace(
+                '}', ' ')
+            msg = msg.casefold()  # some skills need lowercase (eg. the cows list)
+            self.add_event('recognizer_loop:audio_output_start', self.muteHandler)
+            self.sendMycroftUtt(msg)
+
+        else:
+            logger.info("Chat ID " + self.chat_id + " is not whitelisted, i don't process it")
+            nowhite = ("This is your ChatID: " + self.chat_id)
+            context.bot.send_message(chat_id=self.chat_id, text=nowhite)
+
+    def text_from_audio_file(self, voice):
+        dir_path = os.path.dirname(os.path.realpath(__file__))
+
+        ds = Model(f'{dir_path}/dataset/deepspeech-0.9.3-models.pbmm')
+        ds.enableExternalScorer(f'{dir_path}/dataset/deepspeech-0.9.3-models.scorer')
+        desired_sample_rate = ds.sampleRate()
+
+        input_file = requests.get(voice.get_file().file_path)
+        voice_messages_path = os.path.join(self.settings_write_path, 'voice_messages')
+
+        if not os.path.exists(voice_messages_path):
+            os.makedirs(voice_messages_path)
+
+        voice_file_path = os.path.join(voice_messages_path, str(uuid.uuid4()) + '.wav')
+        audiofile = AudioSegment.from_file(BytesIO(input_file.content), 'ogg')
+        audiofile = audiofile.set_frame_rate(desired_sample_rate)
+        audiofile.export(voice_file_path, format="wav")  # convert to wav
+        with wave.open(voice_file_path, 'rb') as voice_file:
+            audio = np.frombuffer(voice_file.readframes(voice_file.getnframes()), np.int16)
+            infered_text = ds.stt(audio)
+            print(infered_text)
+            os.remove(voice_file_path)
+
+        logger.info("It's audio")
+        self.sendMycroftSay("WOW ITS VOICE!!!")
 
     def sendMycroftUtt(self, msg):
-        self.bus.emit(Message('recognizer_loop:utterance',{"utterances": [msg],"lang": self.lang}))#, "session": session_id}))
+        uri = 'ws://localhost:8181/core'
+        ws = create_connection(uri)
+        utt = '{"context": null, "type": "recognizer_loop:utterance", "data": {"lang": "' + self.lang + '", "utterances": ["' + msg + '"]}}'
+        ws.send(utt)
+        ws.close()
 
     def sendMycroftSay(self, msg):
-        self.bus.emit(Message('speak', {"utterance": msg,"lang": self.lang}))
+        uri = 'ws://localhost:8181/core'
+        ws = create_connection(uri)
+        msg = "say " + msg
+        utt = '{"context": null, "type": "recognizer_loop:utterance", "data": {"lang": "' + self.lang + '", "utterances": ["' + msg + '"]}}'
+        logger.info("Lang IS: " + self.lang)
+        ws.send(utt)
+        ws.close()
 
     def responseHandler(self, message):
         global speak_tele
         if speak_tele == 1:
-           speak_tele = 0
-           response = message.data.get("utterance")
-           self.bus.emit(Message("telegram-skill:response", {"intent_name": "telegram-response", "utterance": response }))
+            speak_tele = 0
+            response = message.data.get("utterance")
+            self.bus.emit(
+                Message("telegram-skill:response", {"intent_name": "telegram-response", "utterance": response}))
 
     def sendHandler(self, message):
         sendData = message.data.get("utterance")
-        logger.info("Sending to Telegram-User: " + sendData ) 
+        logger.info("Sending to Telegram-User: " + sendData)
         sendbot = telegram.Bot(token=self.bottoken)
         sendbot.send_message(chat_id=self.chat_id, text=sendData)
-    
+
     def muteHandler(self, message):
         global speak_tele
         if (self.mute == 'true') or (self.mute == 'True'):
-           self.mixer.setmute(1)
-           wait_while_speaking()
-           self.mixer.setmute(0)
+            self.mixer.setmute(1)
+            wait_while_speaking()
+            self.mixer.setmute(0)
         self.remove_event('recognizer_loop:audio_output_start')
 
-    def shutdown(self): # shutdown routine
+    def shutdown(self):  # shutdown routine
         if self.telegram_updater is not None:
-            self.telegram_updater.stop() # will stop update and dispatcher
+            self.telegram_updater.stop()  # will stop update and dispatcher
             self.telegram_updater.is_idle = False
         global speak_tele
         speak_tele = 0
         super(TelegramSkill, self).shutdown()
 
-    def stop(self):
-        global speak_tele
-        speak_tele = 0
 
 def create_skill():
     return TelegramSkill()
