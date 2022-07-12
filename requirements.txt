@@ -1,2 +1,5 @@
 python-telegram-bot>=12.0
 pytz>=2020.1
+numpy==1.23.0
+pydub==0.25.1
+deepspeech
